@@ -1,0 +1,18 @@
+{
+  "name": "xchange-escrow-program",
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "test": "node --import tsx --test tests/escrow.test.ts"
+  },
+  "dependencies": {
+    "@coral-xyz/anchor": "^0.31.1",
+    "@solana/spl-token": "^0.4.15",
+    "@solana/web3.js": "^1.99.0"
+  },
+  "devDependencies": {
+    "tsx": "^4.20.0",
+    "typescript": "^5.9.0"
+  },
+  "license": "MIT"
+}

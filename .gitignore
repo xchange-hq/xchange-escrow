@@ -1,0 +1,10 @@
+node_modules/
+dist/
+target/
+.anchor/
+*.tsbuildinfo
+.env
+.env.*
+# Never commit a keypair.
+*-keypair.json
+id.json
