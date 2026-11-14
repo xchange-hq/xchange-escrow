@@ -61,6 +61,32 @@ export interface SolanaEscrowState {
 /** Accounts per getMultipleAccounts call: PublicNode answers no more than ten. */
 const ACCOUNTS_PER_CALL = 10;
 
+/** An escrow account's size: 8 + Escrow::INIT_SPACE. Every escrow the program made has it. */
+const ESCROW_ACCOUNT_BYTES = 140;
+
+/**
+ * An escrow that finished, released or refunded, and was left open with an
+ * empty vault: what `close_finished` closes, and the rent each account holds.
+ */
+export interface FinishedEscrow {
+  readonly escrow: string;
+  /** The 16 bytes of its order id, read from the account itself. */
+  readonly orderId: readonly number[];
+  readonly status: 'released' | 'refunded';
+  readonly mint: string;
+  readonly token2022: boolean;
+  readonly vault: string;
+  readonly escrowLamports: number;
+  readonly vaultLamports: number;
+}
+
+/** An escrow the scan found and will not close, with the reason. Funded ones are only counted. */
+export interface SkippedEscrow {
+  readonly escrow: string;
+  readonly status: 'released' | 'refunded';
+  readonly reason: string;
+}
+
 type EscrowAccount = Awaited<ReturnType<Program<XchangeEscrow>['account']['escrow']['fetch']>>;
 
 function escrowState(e: EscrowAccount): SolanaEscrowState {
@@ -80,6 +106,12 @@ export interface UnsignedSolanaTx {
   /** base64 of the serialized transaction, fee payer's signature included. */
   readonly tx: string;
   readonly summary: string;
+  /**
+   * The last block height its blockhash is valid for: past it (with the
+   * margin `safeBlockHeight` applies) the transaction can never land, so a
+   * deposit signed and not seen on chain by then never will be.
+   */
+  readonly validUntil?: number;
 }
 
 /** 16 bytes of order id, from a uuid. */
@@ -191,7 +223,29 @@ export class SolanaEscrow {
     return {
       tx: tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString('base64'),
       summary,
+      validUntil: lastValidBlockHeight,
     };
+  }
+
+  /**
+   * The current block height, read the way `payoutStatus` reads it: from a
+   * fresh blockhash's last valid height less the 150 blocks it is valid for.
+   * Not getBlockHeight, which PublicNode answers with the slot. A signed
+   * transaction is dead for good once this exceeds its `validUntil` by 150.
+   */
+  async safeBlockHeight(): Promise<number> {
+    return (await this.safeBlockHeightAt()).height;
+  }
+
+  /**
+   * The same height with the slot it was read at, so a read that must not
+   * be older than it can say so (`readEscrows`' `minContextSlot`): the RPC is
+   * a pool of nodes, and one behind could answer "no escrow" for a deposit
+   * that has landed.
+   */
+  async safeBlockHeightAt(): Promise<{ height: number; slot: number }> {
+    const { context, value } = await this.#connection.getLatestBlockhashAndContext('confirmed');
+    return { height: value.lastValidBlockHeight - 150, slot: context.slot };
   }
 
   async isRegistered(owner: string): Promise<boolean> {
@@ -327,6 +381,15 @@ export class SolanaEscrow {
     );
   }
 
+  /**
+   * A mint's account as the chain has it, for the plain-mint check
+   * (mint-check.ts): one getAccountInfo, a few hundred bytes each way.
+   */
+  async mintAccount(mint: string): Promise<{ owner: string; data: Uint8Array } | null> {
+    const info = await this.#connection.getAccountInfo(new PublicKey(mint), this.#c.commitment);
+    return info === null ? null : { owner: info.owner.toBase58(), data: info.data };
+  }
+
   /** A token transfer from the person's wallet, fee paid by xchange's fee payer, for the phone to sign. */
   /** Whether `owner` already has a token account for `mint`: a send to them opens none. */
   async tokenAccountExists(owner: string, mint: string, token2022: boolean): Promise<boolean> {
@@ -428,6 +491,7 @@ export class SolanaEscrow {
     return {
       tx: tx.serialize({ requireAllSignatures: false, verifySignatures: false }).toString('base64'),
       summary: 'Send',
+      validUntil: lastValidBlockHeight,
     };
   }
 
@@ -638,6 +702,172 @@ export class SolanaEscrow {
       .rpc({ commitment: this.#c.commitment });
   }
 
+  // ---- closing escrows that finished and were left open ---------------------
+
+  /**
+   * Every escrow the program holds, read from the chain: one
+   * getProgramAccounts filtered to escrow accounts (their size and
+   * discriminator), then the mints and vaults ten to a getMultipleAccounts
+   * call. Those that are released or refunded and whose vault exists, is the
+   * escrow's own and holds nothing are what `close_finished` can close; any
+   * other finished one is listed with the reason it is left; funded ones are
+   * counted and left alone. Laptop-only: about 250 bytes an escrow account
+   * comes back, a few kilobytes in all; never run on a server.
+   */
+  async finishedEscrows(): Promise<{
+    closable: FinishedEscrow[];
+    skipped: SkippedEscrow[];
+    funded: number;
+  }> {
+    const prog = this.#prog();
+    const def = prog.idl.accounts.find((a) => a.name.toLowerCase() === 'escrow');
+    if (def === undefined) throw new Error('the IDL has no escrow account');
+    const all = await this.#connection.getProgramAccounts(this.#programId, {
+      commitment: this.#c.commitment,
+      filters: [
+        { dataSize: ESCROW_ACCOUNT_BYTES },
+        { memcmp: { offset: 0, bytes: utils.bytes.bs58.encode(Buffer.from(def.discriminator)) } },
+      ],
+    });
+    const finished: { address: PublicKey; e: EscrowAccount; lamports: number }[] = [];
+    let funded = 0;
+    for (const a of all) {
+      const e = prog.coder.accounts.decode<EscrowAccount>(def.name, a.account.data);
+      if (escrowState(e).status === 'funded') funded += 1;
+      else finished.push({ address: a.pubkey, e, lamports: a.account.lamports });
+    }
+    // Which token program each mint belongs to: its owner.
+    const mints = [...new Set(finished.map((f) => f.e.mint.toBase58()))];
+    const mintProgram = new Map<string, PublicKey | null>();
+    for (let i = 0; i < mints.length; i += ACCOUNTS_PER_CALL) {
+      const chunk = mints.slice(i, i + ACCOUNTS_PER_CALL);
+      const infos = await this.#connection.getMultipleAccountsInfo(
+        chunk.map((m) => new PublicKey(m)),
+        this.#c.commitment,
+      );
+      chunk.forEach((m, j) => {
+        const owner = infos[j]?.owner ?? null;
+        mintProgram.set(
+          m,
+          owner !== null && (owner.equals(TOKEN_PROGRAM_ID) || owner.equals(TOKEN_2022_PROGRAM_ID))
+            ? owner
+            : null,
+        );
+      });
+    }
+    const closable: FinishedEscrow[] = [];
+    const skipped: SkippedEscrow[] = [];
+    for (let i = 0; i < finished.length; i += ACCOUNTS_PER_CALL) {
+      const chunk = finished.slice(i, i + ACCOUNTS_PER_CALL);
+      const vaults = chunk.map((f) => {
+        const program = mintProgram.get(f.e.mint.toBase58()) ?? null;
+        return program === null
+          ? null
+          : getAssociatedTokenAddressSync(f.e.mint, f.address, true, program);
+      });
+      const infos = await this.#connection.getMultipleAccountsInfo(
+        vaults.map((v) => v ?? PublicKey.default),
+        this.#c.commitment,
+      );
+      chunk.forEach((f, j) => {
+        const status = escrowState(f.e).status as 'released' | 'refunded';
+        const program = mintProgram.get(f.e.mint.toBase58()) ?? null;
+        const vault = vaults[j];
+        const info = infos[j];
+        // Why it cannot be closed, or null when it can. A token account: mint
+        // at 0, owner at 32, amount at 64.
+        const why = ((): string | null => {
+          if (program === null || vault === null || vault === undefined)
+            return `its mint ${f.e.mint.toBase58()} is not a token mint the chain shows`;
+          if (info === null || info === undefined) return 'its vault does not exist';
+          const data = Buffer.from(info.data);
+          if (!info.owner.equals(program) || data.length < 72)
+            return 'its vault is not a token account';
+          if (!new PublicKey(data.subarray(0, 32)).equals(f.e.mint))
+            return 'its vault holds another mint';
+          if (!new PublicKey(data.subarray(32, 64)).equals(f.address))
+            return 'its vault belongs to someone else';
+          const held = data.readBigUInt64LE(64);
+          return held === 0n ? null : `its vault holds ${held.toString()} units`;
+        })();
+        if (why !== null || program === null || vault === null || vault === undefined || !info) {
+          skipped.push({ escrow: f.address.toBase58(), status, reason: why ?? 'unreadable' });
+          return;
+        }
+        closable.push({
+          escrow: f.address.toBase58(),
+          orderId: Array.from(f.e.orderId),
+          status,
+          mint: f.e.mint.toBase58(),
+          token2022: program.equals(TOKEN_2022_PROGRAM_ID),
+          vault: vault.toBase58(),
+          escrowLamports: f.lamports,
+          vaultLamports: info.lamports,
+        });
+      });
+    }
+    return { closable, skipped, funded };
+  }
+
+  /**
+   * The transaction that closes one finished escrow: `close_finished`, both
+   * rents to `rentTo`, which the program refuses unless it is the address
+   * `set_rent_to` set. Anyone may send it; `payer` signs only as the
+   * transaction's fee payer. Built here, not signed or sent.
+   */
+  async closeFinishedTx(
+    payer: PublicKey,
+    e: FinishedEscrow,
+    rentTo: string,
+  ): Promise<{ tx: Transaction; lastValidBlockHeight: number }> {
+    const program = SolanaEscrow.tokenProgram(e.token2022);
+    const ix = await this.#prog()
+      .methods.closeFinished([...e.orderId])
+      .accountsPartial({
+        escrow: new PublicKey(e.escrow),
+        vault: new PublicKey(e.vault),
+        mint: new PublicKey(e.mint),
+        rent: this.rentAddress,
+        rentTo: new PublicKey(rentTo),
+        tokenProgram: program,
+      })
+      .instruction();
+    const { blockhash, lastValidBlockHeight } = await this.#connection.getLatestBlockhash(
+      this.#c.commitment,
+    );
+    return {
+      tx: new Transaction({ feePayer: payer, blockhash, lastValidBlockHeight }).add(ix),
+      lastValidBlockHeight,
+    };
+  }
+
+  /** Close one finished escrow, `payer` paying the network fee, and wait for it. */
+  async closeFinished(payer: Keypair, e: FinishedEscrow, rentTo: string): Promise<string> {
+    const { tx, lastValidBlockHeight } = await this.closeFinishedTx(payer.publicKey, e, rentTo);
+    tx.sign(payer);
+    const signature = await this.#connection.sendRawTransaction(tx.serialize(), {
+      preflightCommitment: this.#c.commitment,
+    });
+    const r = await this.#connection.confirmTransaction(
+      { signature, blockhash: tx.recentBlockhash ?? '', lastValidBlockHeight },
+      this.#c.commitment,
+    );
+    if (r.value.err !== null)
+      throw new Error(`${signature} failed: ${JSON.stringify(r.value.err)}`);
+    return signature;
+  }
+
+  /** The program's `rent` PDA, which names where closed escrows' rent goes. */
+  get rentAddress(): PublicKey {
+    return this.#pda(Buffer.from('rent'));
+  }
+
+  /** The program's authority and coordinator, as its config account names them. */
+  async roles(): Promise<{ authority: string; coordinator: string }> {
+    const c = await this.#prog().account.config.fetch(this.configAddress);
+    return { authority: c.authority.toBase58(), coordinator: c.coordinator.toBase58() };
+  }
+
   // ---- reads ----------------------------------------------------------------
 
   async escrow(orderId: string): Promise<SolanaEscrowState | null> {
@@ -651,10 +881,46 @@ export class SolanaEscrow {
    * few minutes. A chunk the RPC did not answer is left out of the map, so
    * the caller can tell it from an escrow that does not exist (null).
    */
-  async readEscrows(orderIds: readonly string[]): Promise<Map<string, SolanaEscrowState | null>> {
+  async readEscrows(
+    orderIds: readonly string[],
+    minContextSlot?: number,
+  ): Promise<Map<string, SolanaEscrowState | null>> {
     const out = new Map<string, SolanaEscrowState | null>();
     for (let i = 0; i < orderIds.length; i += ACCOUNTS_PER_CALL) {
       const chunk = orderIds.slice(i, i + ACCOUNTS_PER_CALL);
+      if (minContextSlot !== undefined) {
+        // Not older than `minContextSlot`: a node behind it refuses, and the
+        // chunk is tried again twice, 400 ms apart; still refused, or
+        // answered from an older slot, or short, it is left out (unknown),
+        // never read as "no escrow". Probed on 11 Nov 2026 against PublicNode:
+        // 60 of 60 such reads answered at the tip and 5 and 20 slots behind.
+        for (let attempt = 0; attempt < 3; attempt += 1) {
+          try {
+            const { context, value } = await this.#connection.getMultipleAccountsInfoAndContext(
+              chunk.map((id) => this.escrowOf(id)),
+              { commitment: this.#c.commitment, minContextSlot },
+            );
+            if (context.slot < minContextSlot || value.length !== chunk.length) break;
+            // Decoded the way the account client decodes it, by the IDL's own name.
+            const prog = this.#prog();
+            const name =
+              prog.idl.accounts.find((a) => a.name.toLowerCase() === 'escrow')?.name ?? 'Escrow';
+            chunk.forEach((id, j) => {
+              const info = value[j];
+              out.set(
+                id,
+                info === null || info === undefined
+                  ? null
+                  : escrowState(prog.coder.accounts.decode(name, info.data)),
+              );
+            });
+            break;
+          } catch {
+            if (attempt < 2) await new Promise((r) => setTimeout(r, 400));
+          }
+        }
+        continue;
+      }
       try {
         const got = await this.#prog().account.escrow.fetchMultiple(
           chunk.map((id) => this.escrowOf(id)),

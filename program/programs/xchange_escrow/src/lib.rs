@@ -14,7 +14,9 @@
 //! leaves, by release or refund, the vault and the escrow account are closed
 //! and their rent goes to the address the authority set with `set_rent_to`:
 //! the wallet that paid the rent in the first place. Before that address is
-//! set, nothing closes and nothing changes.
+//! set, nothing closes and nothing changes. An escrow that finished and was
+//! left open is closed the same way, to the same address, by anyone with
+//! `close_finished`.
 
 use anchor_lang::prelude::*;
 
@@ -269,6 +271,25 @@ pub mod xchange_escrow {
             &ctx.accounts.vault,
             &ctx.accounts.rent,
             &ctx.accounts.rent_to,
+            &ctx.accounts.token_program,
+        )
+    }
+
+    /// Close one escrow that already finished but was left open: released or
+    /// refunded before closing existed, or by a client that named no rent
+    /// destination. Never a funded escrow, and never while its vault holds
+    /// anything. Both rents go to the address the authority set with
+    /// `set_rent_to`, and nowhere else. Anyone may ask, paying the network
+    /// fee: nothing can move but rent, a finished escrow holds no funds, and
+    /// the rent goes only where the authority said.
+    pub fn close_finished(ctx: Context<CloseFinished>, _order_id: [u8; 16]) -> Result<()> {
+        require!(ctx.accounts.escrow.state != State::Funded, EscrowError::StillFunded);
+        require!(ctx.accounts.vault.amount == 0, EscrowError::VaultNotEmpty);
+        close_empty(
+            &ctx.accounts.escrow,
+            &ctx.accounts.vault,
+            &Some(ctx.accounts.rent.clone()),
+            &Some(ctx.accounts.rent_to.clone()),
             &ctx.accounts.token_program,
         )
     }
@@ -551,6 +572,23 @@ pub struct Refund<'info> {
     pub token_program: Interface<'info, TokenInterface>,
 }
 
+#[derive(Accounts)]
+#[instruction(order_id: [u8; 16])]
+pub struct CloseFinished<'info> {
+    #[account(mut, seeds = [b"escrow", order_id.as_ref()], bump = escrow.bump, has_one = mint)]
+    pub escrow: Account<'info, Escrow>,
+    #[account(mut, associated_token::mint = mint, associated_token::authority = escrow, associated_token::token_program = token_program)]
+    pub vault: InterfaceAccount<'info, TokenAccount>,
+    pub mint: InterfaceAccount<'info, Mint>,
+    /// Where the rent goes: required here, so nothing closes without it.
+    #[account(seeds = [b"rent"], bump)]
+    pub rent: Account<'info, RentTo>,
+    /// CHECK: must be the address the `rent` account names; checked in close_empty.
+    #[account(mut)]
+    pub rent_to: UncheckedAccount<'info>,
+    pub token_program: Interface<'info, TokenInterface>,
+}
+
 #[error_code]
 pub enum EscrowError {
     #[msg("The fee is above the allowed maximum")]
@@ -575,4 +613,8 @@ pub enum EscrowError {
     BadAmount,
     #[msg("Rent may only go to the address the authority set")]
     WrongRentDestination,
+    #[msg("This escrow still holds funds")]
+    StillFunded,
+    #[msg("This escrow's vault is not empty")]
+    VaultNotEmpty,
 }

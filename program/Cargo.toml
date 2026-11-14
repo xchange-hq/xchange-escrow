@@ -4,5 +4,10 @@ resolver = "2"
 
 [profile.release]
 overflow-checks = true
+# Optimised for size: with close_finished the build is 285,128 bytes and fits
+# the 332,000 bytes the program already has on mainnet, where the default
+# (opt-level 3) is 341,384 and would need the program extended for good.
+# Overflow checks stay on.
+opt-level = "s"
 lto = "fat"
 codegen-units = 1

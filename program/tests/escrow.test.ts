@@ -1,15 +1,22 @@
 import { AnchorProvider, BN, Program, Wallet, web3 } from '@coral-xyz/anchor';
 import {
+  ExtensionType,
   TOKEN_2022_PROGRAM_ID,
+  TOKEN_PROGRAM_ID,
   createAssociatedTokenAccountIdempotent,
+  createInitializeMetadataPointerInstruction,
+  createInitializeMint2Instruction,
+  createInitializeMintCloseAuthorityInstruction,
   createMint,
+  createTransferCheckedInstruction,
   getAccount,
   getAssociatedTokenAddressSync,
+  getMintLen,
   mintTo,
 } from '@solana/spl-token';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { before, describe, it } from 'node:test';
+import { after, before, describe, it } from 'node:test';
 
 /**
  * The escrow's rules, exercised end to end against a validator: local by
@@ -378,5 +385,409 @@ describe('xchange escrow', () => {
       program.methods.setFee(1001).accounts({ authority: payer.publicKey }).rpc(),
       'FeeTooHigh',
     );
+  });
+
+  /**
+   * Escrows that finished before closing existed: released or refunded with
+   * no rent accounts, exactly as the program left them before 9 Oct 2026.
+   * `close_finished` closes them, to the configured address only, and
+   * nothing else. Both token programs: a plain Token mint like USDC, and a
+   * Token-2022 mint with the two extensions both XGE mints carry on mainnet
+   * (mint close authority and metadata pointer, 270 bytes).
+   */
+  describe('close_finished', () => {
+    type Asset = { mint: web3.PublicKey; program: web3.PublicKey; name: string };
+    let usdcLike: Asset;
+    let xgeLike: Asset;
+    /** Where rent goes in these tests: a fresh address, so every lamport that arrives is counted. */
+    const sink = web3.Keypair.generate().publicKey;
+    const ataOf = (a: Asset, owner: web3.PublicKey) =>
+      getAssociatedTokenAddressSync(a.mint, owner, true, a.program);
+    const vaultOf = (a: Asset, id: number[]) => ataOf(a, escrowPda(new Uint8Array(id)));
+
+    async function xgeLikeMint(): Promise<web3.PublicKey> {
+      const kp = web3.Keypair.generate();
+      const len = getMintLen([ExtensionType.MintCloseAuthority, ExtensionType.MetadataPointer]);
+      const tx = new web3.Transaction().add(
+        web3.SystemProgram.createAccount({
+          fromPubkey: payer.publicKey,
+          newAccountPubkey: kp.publicKey,
+          space: len,
+          lamports: await conn.getMinimumBalanceForRentExemption(len),
+          programId: T22,
+        }),
+        createInitializeMintCloseAuthorityInstruction(kp.publicKey, payer.publicKey, T22),
+        createInitializeMetadataPointerInstruction(
+          kp.publicKey,
+          payer.publicKey,
+          kp.publicKey,
+          T22,
+        ),
+        createInitializeMint2Instruction(kp.publicKey, 6, payer.publicKey, null, T22),
+      );
+      await provider.sendAndConfirm(tx, [kp]);
+      return kp.publicKey;
+    }
+
+    const depositA = (
+      a: Asset,
+      depositor: web3.Keypair,
+      id: number[],
+      amount: number,
+      cp: web3.PublicKey | null,
+    ) =>
+      program.methods
+        .deposit(id, new BN(amount), cp, new BN(now() + 3600))
+        .accounts({
+          mint: a.mint,
+          depositorToken: ataOf(a, depositor.publicKey),
+          depositor: depositor.publicKey,
+          payer: payer.publicKey,
+          tokenProgram: a.program,
+        })
+        .signers([depositor])
+        .rpc();
+    /** A release as the program did it before rent accounts existed: paid, marked released, left open. */
+    const releaseOld = (a: Asset, id: number[], to: web3.PublicKey) =>
+      program.methods
+        .release(id)
+        .accounts({
+          coordinator: coordinator.publicKey,
+          mint: a.mint,
+          counterpartyToken: ataOf(a, to),
+          tokenProgram: a.program,
+          rentTo: null,
+        })
+        .signers([coordinator])
+        .rpc();
+    const refundOld = (a: Asset, id: number[], depositor: web3.Keypair) =>
+      program.methods
+        .refund(id)
+        .accounts({
+          mint: a.mint,
+          depositor: depositor.publicKey,
+          depositorToken: ataOf(a, depositor.publicKey),
+          caller: depositor.publicKey,
+          tokenProgram: a.program,
+          rentTo: null,
+        })
+        .signers([depositor])
+        .rpc();
+    const close = (
+      a: Asset,
+      id: number[],
+      o: {
+        signer?: web3.Keypair;
+        to?: web3.PublicKey;
+        escrow?: web3.PublicKey;
+        vault?: web3.PublicKey;
+        tokenProgram?: web3.PublicKey;
+        rent?: web3.PublicKey;
+      } = {},
+    ) => {
+      const accounts: Record<string, web3.PublicKey> = {
+        mint: a.mint,
+        rentTo: o.to ?? sink,
+        tokenProgram: o.tokenProgram ?? a.program,
+      };
+      if (o.escrow !== undefined) accounts.escrow = o.escrow;
+      if (o.vault !== undefined) accounts.vault = o.vault;
+      if (o.rent !== undefined) accounts.rent = o.rent;
+      const m = program.methods.closeFinished(id).accountsPartial(accounts);
+      if (o.signer === undefined) return m.rpc();
+      // Anyone may ask: the signer is only the transaction's fee payer.
+      const signer = o.signer;
+      return m.transaction().then((tx) => {
+        tx.feePayer = signer.publicKey;
+        return web3.sendAndConfirmTransaction(conn, tx, [signer], { commitment: 'confirmed' });
+      });
+    };
+    const lamportsOf = async (k: web3.PublicKey): Promise<number> =>
+      (await conn.getAccountInfo(k, 'confirmed'))?.lamports ?? 0;
+
+    before(async () => {
+      usdcLike = {
+        name: 'Token',
+        program: TOKEN_PROGRAM_ID,
+        mint: await createMint(
+          conn,
+          payer,
+          payer.publicKey,
+          null,
+          6,
+          undefined,
+          undefined,
+          TOKEN_PROGRAM_ID,
+        ),
+      };
+      xgeLike = { name: 'Token-2022', program: T22, mint: await xgeLikeMint() };
+      assert.equal(
+        (await conn.getAccountInfo(xgeLike.mint))?.data.length,
+        270,
+        'laid out as the live XGE mints',
+      );
+      for (const a of [usdcLike, xgeLike]) {
+        for (const k of [maker, taker, stranger])
+          await createAssociatedTokenAccountIdempotent(
+            conn,
+            payer,
+            a.mint,
+            k.publicKey,
+            undefined,
+            a.program,
+          );
+        await mintTo(
+          conn,
+          payer,
+          a.mint,
+          ataOf(a, maker.publicKey),
+          payer,
+          1_000_000_000n,
+          [],
+          undefined,
+          a.program,
+        );
+      }
+      // The authority points rent at the sink for these tests, and back to the payer after.
+      await program.methods.setRentTo(sink).accounts({ authority: payer.publicKey }).rpc();
+    });
+
+    for (const which of ['Token', 'Token-2022']) {
+      it(`closes a released and a refunded escrow (${which}), every lamport of both rents to the configured address`, async () => {
+        const a = which === 'Token' ? usdcLike : xgeLike;
+        const released = orderId();
+        const refunded = orderId();
+        await depositA(a, maker, released, 10_000_000, taker.publicKey);
+        await releaseOld(a, released, taker.publicKey);
+        await depositA(a, maker, refunded, 10_000_000, null);
+        await refundOld(a, refunded, maker);
+        for (const [id, state] of [
+          [released, { released: {} }],
+          [refunded, { refunded: {} }],
+        ] as const) {
+          assert.deepEqual(
+            (await program.account.escrow.fetch(escrowPda(new Uint8Array(id)))).state,
+            state,
+          );
+          assert.equal(await escrowGone(id), false, 'left open, as before v2');
+          const rent =
+            (await lamportsOf(escrowPda(new Uint8Array(id)))) + (await lamportsOf(vaultOf(a, id)));
+          const sinkBefore = await lamportsOf(sink);
+          const sig = await close(a, id);
+          const landed = await conn.getTransaction(sig, {
+            commitment: 'confirmed',
+            maxSupportedTransactionVersion: 0,
+          });
+          const meta = landed?.meta;
+          assert.ok(landed !== null && meta !== null && meta !== undefined);
+          assert.equal(
+            (await lamportsOf(sink)) - sinkBefore,
+            rent,
+            'both rents, exactly, to the sink',
+          );
+          // Within the close itself, every account but the signer (who pays
+          // the fee; its balance is too large here for exact arithmetic in a
+          // JS number), the escrow, its vault and the sink is untouched.
+          const moved = new Set([
+            escrowPda(new Uint8Array(id)).toBase58(),
+            vaultOf(a, id).toBase58(),
+            sink.toBase58(),
+          ]);
+          landed.transaction.message.staticAccountKeys.forEach((k, i) => {
+            if (i === 0 || moved.has(k.toBase58())) return;
+            assert.equal(meta.postBalances[i], meta.preBalances[i], `${k.toBase58()} unchanged`);
+          });
+          assert.ok(meta.preBalances[0]! >= meta.postBalances[0]!, 'the signer gains nothing');
+          assert.equal(
+            (await conn.getAccountInfo(escrowPda(new Uint8Array(id)), 'confirmed')) === null &&
+              (await conn.getAccountInfo(vaultOf(a, id), 'confirmed')) === null,
+            true,
+          );
+          // And never twice.
+          await fails(close(a, id), 'AccountNotInitialized');
+        }
+      });
+    }
+
+    it('refuses a funded escrow, even once it has expired', async () => {
+      for (const a of [usdcLike, xgeLike]) {
+        const id = orderId();
+        await program.methods
+          .deposit(id, new BN(5_000_000), null, new BN(now() + 2))
+          .accounts({
+            mint: a.mint,
+            depositorToken: ataOf(a, maker.publicKey),
+            depositor: maker.publicKey,
+            payer: payer.publicKey,
+            tokenProgram: a.program,
+          })
+          .signers([maker])
+          .rpc();
+        await fails(close(a, id), 'StillFunded');
+        await new Promise((r) => setTimeout(r, 3000));
+        await fails(close(a, id), 'StillFunded');
+        assert.equal(
+          (await getAccount(conn, vaultOf(a, id), 'confirmed', a.program)).amount,
+          5_000_000n,
+          'the deposit is untouched',
+        );
+        // Its owner still has every door they had.
+        await refundOld(a, id, maker);
+      }
+    });
+
+    it('refuses a finished escrow whose vault holds anything, even one unit sent to it afterwards', async () => {
+      for (const a of [usdcLike, xgeLike]) {
+        const id = orderId();
+        await depositA(a, maker, id, 1_000_000, taker.publicKey);
+        await releaseOld(a, id, taker.publicKey);
+        await provider.sendAndConfirm(
+          new web3.Transaction().add(
+            createTransferCheckedInstruction(
+              ataOf(a, maker.publicKey),
+              a.mint,
+              vaultOf(a, id),
+              maker.publicKey,
+              1n,
+              6,
+              [],
+              a.program,
+            ),
+          ),
+          [maker],
+        );
+        await fails(close(a, id), 'VaultNotEmpty');
+        assert.equal((await getAccount(conn, vaultOf(a, id), 'confirmed', a.program)).amount, 1n);
+      }
+    });
+
+    it('sends rent nowhere but the configured address, whoever asks', async () => {
+      const a = xgeLike;
+      const id = orderId();
+      await depositA(a, maker, id, 1_000_000, taker.publicKey);
+      await releaseOld(a, id, taker.publicKey);
+      await fails(close(a, id, { to: stranger.publicKey }), 'WrongRentDestination');
+      await fails(close(a, id, { to: payer.publicKey }), 'WrongRentDestination');
+      // A stranger asking for the rent to come to themselves is refused too.
+      await fails(
+        close(a, id, { signer: stranger, to: stranger.publicKey }),
+        'WrongRentDestination',
+      );
+      // A rent account that is not the program's own `rent` PDA is refused.
+      await fails(close(a, id, { rent: config }), 'AccountDiscriminatorMismatch');
+      assert.equal(await escrowGone(id), false);
+      await close(a, id);
+      assert.equal(await escrowGone(id), true);
+    });
+
+    it('anyone may close a finished, empty escrow; the rent still goes only to the configured address', async () => {
+      for (const a of [usdcLike, xgeLike]) {
+        const id = orderId();
+        await depositA(a, maker, id, 1_000_000, taker.publicKey);
+        await releaseOld(a, id, taker.publicKey);
+        const rent =
+          (await lamportsOf(escrowPda(new Uint8Array(id)))) + (await lamportsOf(vaultOf(a, id)));
+        const sinkBefore = await lamportsOf(sink);
+        const strangerBefore = await lamportsOf(stranger.publicKey);
+        const sig = await close(a, id, { signer: stranger });
+        const fee =
+          (
+            await conn.getTransaction(sig, {
+              commitment: 'confirmed',
+              maxSupportedTransactionVersion: 0,
+            })
+          )?.meta?.fee ?? -1;
+        assert.equal((await lamportsOf(sink)) - sinkBefore, rent, 'both rents to the sink');
+        assert.equal(
+          strangerBefore - (await lamportsOf(stranger.publicKey)),
+          fee,
+          'the stranger pays the network fee and receives nothing',
+        );
+        assert.equal(await escrowGone(id), true);
+      }
+      // And a stranger is refused everything anyone else is refused.
+      const a = usdcLike;
+      const funded = orderId();
+      await depositA(a, maker, funded, 1_000_000, null);
+      await fails(close(a, funded, { signer: stranger }), 'StillFunded');
+      const dusted = orderId();
+      await depositA(a, maker, dusted, 1_000_000, taker.publicKey);
+      await releaseOld(a, dusted, taker.publicKey);
+      await provider.sendAndConfirm(
+        new web3.Transaction().add(
+          createTransferCheckedInstruction(
+            ataOf(a, maker.publicKey),
+            a.mint,
+            vaultOf(a, dusted),
+            maker.publicKey,
+            1n,
+            6,
+            [],
+            a.program,
+          ),
+        ),
+        [maker],
+      );
+      await fails(close(a, dusted, { signer: stranger }), 'VaultNotEmpty');
+      assert.equal(
+        (await getAccount(conn, vaultOf(a, funded), 'confirmed', a.program)).amount,
+        1_000_000n,
+      );
+      await refundOld(a, funded, maker);
+    });
+
+    it("refuses another escrow's vault, the wrong token program, and an account that is not this escrow", async () => {
+      const a = usdcLike;
+      const one = orderId();
+      const two = orderId();
+      for (const id of [one, two]) {
+        await depositA(a, maker, id, 1_000_000, taker.publicKey);
+        await releaseOld(a, id, taker.publicKey);
+      }
+      // Another finished escrow's empty vault, offered as this one's.
+      await fails(close(a, one, { vault: vaultOf(a, two) }), 'ConstraintTokenOwner');
+      // A vault of the right owner under the other token program does not exist, and is refused.
+      await fails(close(a, one, { tokenProgram: T22 }), 'AccountNotInitialized');
+      // The escrow must be the PDA of the order id given: another escrow is refused.
+      await fails(
+        close(a, one, { escrow: escrowPda(new Uint8Array(two)), vault: vaultOf(a, two) }),
+        'ConstraintSeeds',
+      );
+      // An account owned by another program (the mint, owned by Token) is refused.
+      await fails(close(a, one, { escrow: a.mint }), 'AccountOwnedByWrongProgram');
+      assert.equal(await escrowGone(one), false);
+      assert.equal(await escrowGone(two), false);
+      await close(a, one);
+      await close(a, two);
+      assert.equal((await escrowGone(one)) && (await escrowGone(two)), true);
+    });
+
+    it('every other door is unchanged: an escrow it cannot close still refunds and releases as before', async () => {
+      const a = xgeLike;
+      const id = orderId();
+      await depositA(a, maker, id, 2_000_000, taker.publicKey);
+      await fails(close(a, id), 'StillFunded');
+      // Released by a current client, with rent accounts: closed at once, as v2 does.
+      await program.methods
+        .release(id)
+        .accounts({
+          coordinator: coordinator.publicKey,
+          mint: a.mint,
+          counterpartyToken: ataOf(a, taker.publicKey),
+          tokenProgram: a.program,
+          rentTo: sink,
+        })
+        .signers([coordinator])
+        .rpc();
+      assert.equal(await escrowGone(id), true);
+      await fails(close(a, id), 'AccountNotInitialized');
+    });
+
+    after(async () => {
+      await program.methods
+        .setRentTo(payer.publicKey)
+        .accounts({ authority: payer.publicKey })
+        .rpc();
+    });
   });
 });

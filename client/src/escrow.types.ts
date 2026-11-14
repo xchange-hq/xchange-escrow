@@ -13,6 +13,125 @@ export type XchangeEscrow = {
   };
   instructions: [
     {
+      name: 'closeFinished';
+      docs: [
+        'Close one escrow that already finished but was left open: released or',
+        'refunded before closing existed, or by a client that named no rent',
+        'destination. Never a funded escrow, and never while its vault holds',
+        'anything. Both rents go to the address the authority set with',
+        '`set_rent_to`, and nowhere else. Anyone may ask, paying the network',
+        'fee: nothing can move but rent, a finished escrow holds no funds, and',
+        'the rent goes only where the authority said.',
+      ];
+      discriminator: [199, 150, 61, 66, 164, 239, 127, 189];
+      accounts: [
+        {
+          name: 'escrow';
+          writable: true;
+          pda: {
+            seeds: [
+              {
+                kind: 'const';
+                value: [101, 115, 99, 114, 111, 119];
+              },
+              {
+                kind: 'arg';
+                path: 'orderId';
+              },
+            ];
+          };
+        },
+        {
+          name: 'vault';
+          writable: true;
+          pda: {
+            seeds: [
+              {
+                kind: 'account';
+                path: 'escrow';
+              },
+              {
+                kind: 'account';
+                path: 'tokenProgram';
+              },
+              {
+                kind: 'account';
+                path: 'mint';
+              },
+            ];
+            program: {
+              kind: 'const';
+              value: [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89,
+              ];
+            };
+          };
+        },
+        {
+          name: 'mint';
+          relations: ['escrow'];
+        },
+        {
+          name: 'rent';
+          docs: ['Where the rent goes: required here, so nothing closes without it.'];
+          pda: {
+            seeds: [
+              {
+                kind: 'const';
+                value: [114, 101, 110, 116];
+              },
+            ];
+          };
+        },
+        {
+          name: 'rentTo';
+          writable: true;
+        },
+        {
+          name: 'tokenProgram';
+        },
+      ];
+      args: [
+        {
+          name: 'orderId';
+          type: {
+            array: ['u8', 16];
+          };
+        },
+      ];
+    },
+    {
       name: 'deposit';
       docs: [
         'Lock `amount` of the mint for `order_id`. `counterparty` is known for',
@@ -1135,6 +1254,16 @@ export type XchangeEscrow = {
       code: 6010;
       name: 'wrongRentDestination';
       msg: 'Rent may only go to the address the authority set';
+    },
+    {
+      code: 6011;
+      name: 'stillFunded';
+      msg: 'This escrow still holds funds';
+    },
+    {
+      code: 6012;
+      name: 'vaultNotEmpty';
+      msg: "This escrow's vault is not empty";
     },
   ];
   types: [

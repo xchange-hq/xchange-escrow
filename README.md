@@ -22,6 +22,10 @@ escrowed funds anywhere else.
   anyone once it has expired, always to the depositor.
 - When the last of an escrow's funds leave, its accounts are closed and the
   rent returns to the wallet that paid it.
+- An escrow that finished without being closed can be closed by anyone with
+  `close_finished`. It moves no tokens: it refuses an escrow that is still
+  funded or a vault that is not empty, and the rent goes only to the address
+  the authority set.
 - It works with the Token program and with Token-2022.
 
 ## Instructions
@@ -34,6 +38,7 @@ escrowed funds anywhere else.
 | `release`          | the coordinator  | Pays the whole escrow to its counterparty, less the fee.                  |
 | `release_partial`  | the coordinator  | Pays part of an escrow to a registered wallet, less the fee.              |
 | `refund`           | depositor or any | Returns what is left to the depositor (anyone may call it after expiry).  |
+| `close_finished`   | anyone           | Closes a released or refunded escrow whose vault is empty; rent as set.   |
 | `initialize`       | the authority    | Once: sets the coordinator and the fee.                                   |
 | `set_coordinator`  | the authority    | Changes the coordinator.                                                  |
 | `set_fee`          | the authority    | Changes the fee, never above 10%.                                         |
@@ -79,8 +84,11 @@ anchor test
 ```
 
 The source of the build on mainnet is `program/programs/xchange_escrow/src/lib.rs`
-as it stands here. Its embedded security.txt names the repository it was
-first built from; the next upgrade will name this one.
+as it stands here. The program was last upgraded on 14 November 2026, adding
+`close_finished`; that build is 285,128 bytes, sha256
+`4c7a590e7b811407bfec14f6e184386d1e95635684d15acd86669f0343074f40`. Its
+embedded security.txt names the repository it was first built from; a later
+upgrade will name this one.
 
 ## Use the client
 
